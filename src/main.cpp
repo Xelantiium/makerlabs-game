@@ -1,196 +1,332 @@
-#include <Arduino.h> // Provides Arduino pin, timing and random functions.
+// POCKET BREAKOUT for ESP32-C6 + MAX7219 8x8 matrix + two buttons.
+// Same wiring as the snake game. LEFT button moves the paddle left, RIGHT moves it right.
+// Press BOTH buttons together to launch the ball.
+#include <Arduino.h>
+#include <Preferences.h> // Saves the high score in flash so it survives power-off.
 
-constexpr uint8_t DIN_PIN = 19; // Matrix data signal, through a 5 V level shifter.
-constexpr uint8_t CLK_PIN = 18; // Matrix clock signal, through the level shifter.
-constexpr uint8_t CS_PIN = 20; // Matrix CS/LOAD signal, through the level shifter.
-constexpr uint8_t LEFT_PIN = 21; // Connect the reset button between GPIO21 and GND.
-constexpr uint8_t RIGHT_PIN = 22; // Connect the turn button between GPIO22 and GND.
-constexpr uint32_t STEP_MS = 500; // Milliseconds per move; larger means slower.
-constexpr uint32_t DEBOUNCE_MS = 30; // Ignores brief mechanical button bouncing.
-constexpr uint8_t BRIGHTNESS = 2; // LED brightness from 0 to 15.
-constexpr uint8_t ROTATION = 0; // Rotate the display by 0, 1, 2 or 3 quarter-turns.
-constexpr bool MIRROR_X = false; // Set true if the display is reflected.
-constexpr bool WRAP_EDGES = false; // Set true to pass through the screen edges.
+constexpr uint8_t DIN_PIN = 19;
+constexpr uint8_t CLK_PIN = 18;
+constexpr uint8_t CS_PIN = 20;
+constexpr uint8_t LEFT_PIN = 21;
+constexpr uint8_t RIGHT_PIN = 22;
+constexpr uint32_t DEBOUNCE_MS = 20;
+constexpr uint32_t PADDLE_MS = 80;   // Paddle speed while a button is held (smaller = faster).
+constexpr uint8_t BRIGHTNESS = 2;    // 0 to 15.
+constexpr uint8_t ROTATION = 0;      // Same orientation settings as the snake game.
+constexpr bool MIRROR_X = false;
 
-enum GameState { WAITING, PLAYING, LOST, WON }; // Names the four game states.
-GameState state = WAITING; // Wait for the left button before starting.
-int8_t snakeX[64], snakeY[64]; // Stores each segment; index 0 is the head.
-uint8_t snakeLength = 3; // Starts with three segments.
-uint8_t direction = 1; // Directions: 0 up, 1 right, 2 down, 3 left.
-const int8_t dx[4] = {0, 1, 0, -1}; // Horizontal change for each direction.
-const int8_t dy[4] = {-1, 0, 1, 0}; // Vertical change for each direction.
-int8_t foodX = 0, foodY = 0; // Stores the food position.
-bool turnQueued = false; // Allows only one right turn per move.
-uint8_t pixels[8] = {}; // Stores eight rows of eight LED bits.
-uint32_t lastMove = 0, lastDraw = 0; // Tracks movement and display timing.
-const uint8_t buttonPins[2] = {LEFT_PIN, RIGHT_PIN}; // Lists reset, then right.
-bool lastRaw[2] = {HIGH, HIGH}; // Stores the previous electrical button readings.
-bool stableButton[2] = {HIGH, HIGH}; // Stores the debounced button readings.
-uint32_t changedAt[2] = {0, 0}; // Records when each button last changed.
+enum Mode : uint8_t { DEMO, INTRO, SERVE, PLAY, LOSTBALL, CLEARED, GAMEOVER };
+Mode mode = DEMO;
+uint32_t modeSince = 0;
 
-void maxWrite(uint8_t address, uint8_t value) { // Sends one MAX7219 command.
-    digitalWrite(CS_PIN, LOW); // Begins the transfer.
-    shiftOut(DIN_PIN, CLK_PIN, MSBFIRST, address); // Sends the register address.
-    shiftOut(DIN_PIN, CLK_PIN, MSBFIRST, value); // Sends the register's value.
-    digitalWrite(CS_PIN, HIGH); // Latches the command into the matrix driver.
+// Four brick rows (screen rows 1 to 4). Bit x = column x. Tough bricks need two hits and blink.
+const uint8_t LAYOUT[5][4] = {
+    {0xFF, 0xFF, 0x00, 0x00},
+    {0xFF, 0xFF, 0xFF, 0x00},
+    {0xAA, 0x55, 0xAA, 0x55},
+    {0xFF, 0x7E, 0x3C, 0x18},
+    {0xFF, 0xFF, 0xFF, 0xFF},
+};
+const uint8_t TOUGH[5][4] = {
+    {0x00, 0x00, 0x00, 0x00},
+    {0xFF, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x18, 0x18},
+    {0x81, 0x00, 0x00, 0x81},
+};
+// 3x5 digits for level and score screens. Bit 2 is the left pixel.
+const uint8_t FONT[10][5] = {
+    {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
+    {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7},
+};
+
+uint8_t bricks[8] = {}, tough[8] = {};
+uint8_t pixels[8] = {};
+int px = 2, pw = 3;                 // Paddle left column and width.
+int bx = 3, by = 5, vx = 1, vy = -1; // Ball position and velocity.
+uint8_t lives = 3, level = 0, broken = 0;
+uint16_t score = 0, best = 0;
+bool newBest = false;
+int lastPaddleDir = 0;
+uint32_t lastBall = 0, lastDraw = 0, lastPaddleStep = 0, lastPaddleMove = 0;
+
+const uint8_t buttonPins[2] = {LEFT_PIN, RIGHT_PIN};
+bool lastRaw[2] = {HIGH, HIGH}, stableButton[2] = {HIGH, HIGH};
+uint32_t changedAt[2] = {0, 0};
+bool btnL = false, btnR = false, bothEdge = false, bothPrev = false;
+uint8_t pressedMask = 0;
+
+Preferences prefs;
+
+// ---------- MAX7219 ----------
+void maxWrite(uint8_t address, uint8_t value) {
+    digitalWrite(CS_PIN, LOW);
+    shiftOut(DIN_PIN, CLK_PIN, MSBFIRST, address);
+    shiftOut(DIN_PIN, CLK_PIN, MSBFIRST, value);
+    digitalWrite(CS_PIN, HIGH);
 }
 
-void initMatrix() { // Configures the matrix driver.
-    pinMode(DIN_PIN, OUTPUT); // Makes the data pin an output.
-    pinMode(CLK_PIN, OUTPUT); // Makes the clock pin an output.
-    pinMode(CS_PIN, OUTPUT); // Makes the select pin an output.
-    digitalWrite(CLK_PIN, LOW); // Starts with the clock low.
-    digitalWrite(CS_PIN, HIGH); // Ends any unfinished transfer.
-    maxWrite(0x0F, 0); // Disables the all-LED test mode.
-    maxWrite(0x0C, 0); // Blanks the display during setup.
-    maxWrite(0x09, 0); // Disables seven-segment number decoding.
-    maxWrite(0x0B, 7); // Enables all eight rows.
-    maxWrite(0x0A, BRIGHTNESS); // Sets the LED brightness.
-    for (uint8_t row = 1; row <= 8; ++row) maxWrite(row, 0); // Clears each row.
-    maxWrite(0x0C, 1); // Switches on normal display operation.
+void initMatrix() {
+    pinMode(DIN_PIN, OUTPUT);
+    pinMode(CLK_PIN, OUTPUT);
+    pinMode(CS_PIN, OUTPUT);
+    digitalWrite(CLK_PIN, LOW);
+    digitalWrite(CS_PIN, HIGH);
+    maxWrite(0x0F, 0);
+    maxWrite(0x0C, 0);
+    maxWrite(0x09, 0);
+    maxWrite(0x0B, 7);
+    maxWrite(0x0A, BRIGHTNESS);
+    for (uint8_t row = 1; row <= 8; ++row) maxWrite(row, 0);
+    maxWrite(0x0C, 1);
 }
 
-void putPixel(int x, int y) { // Lights one point in the display buffer.
-    if (MIRROR_X) x = 7 - x; // Optionally reflects the horizontal position.
-    for (uint8_t i = 0; i < ROTATION % 4; ++i) { // Applies each quarter-turn.
-        int oldX = x; // Saves the original horizontal position.
-        x = 7 - y; // Calculates the rotated horizontal position.
-        y = oldX; // Calculates the rotated vertical position.
+void putPixel(int x, int y) {
+    if (x < 0 || x > 7 || y < 0 || y > 7) return;
+    if (MIRROR_X) x = 7 - x;
+    for (uint8_t i = 0; i < ROTATION % 4; ++i) {
+        int oldX = x;
+        x = 7 - y;
+        y = oldX;
     }
-    pixels[y] |= uint8_t(1U << (7 - x)); // Sets this LED's bit in its row.
+    pixels[y] |= uint8_t(1U << (7 - x));
 }
 
-bool occupied(int x, int y, int count) { // Checks part of the snake for a cell.
-    for (int i = 0; i < count; ++i) { // Checks each requested segment.
-        if (snakeX[i] == x && snakeY[i] == y) return true; // Found a segment.
+void drawDigit(uint8_t d, int x0, int y0) {
+    for (int r = 0; r < 5; ++r)
+        for (int c = 0; c < 3; ++c)
+            if (FONT[d][r] & (4 >> c)) putPixel(x0 + c, y0 + r);
+}
+
+void drawNumber(uint16_t n) {
+    if (n > 99) n = 99;
+    if (n < 10) drawDigit(n, 3, 2);
+    else { drawDigit(n / 10, 0, 2); drawDigit(n % 10, 4, 2); }
+}
+
+// ---------- Game helpers ----------
+int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+void setMode(Mode m, uint32_t now) { mode = m; modeSince = now; }
+
+bool brickAt(int x, int y) { return x >= 0 && x < 8 && y >= 0 && y < 8 && (bricks[y] & (1U << x)); }
+
+int bricksLeft() {
+    int n = 0;
+    for (int i = 0; i < 8; ++i) n += __builtin_popcount(bricks[i]);
+    return n;
+}
+
+void loadLevel(uint8_t lv) {
+    for (int i = 0; i < 8; ++i) bricks[i] = tough[i] = 0;
+    for (int r = 0; r < 4; ++r) { bricks[1 + r] = LAYOUT[lv % 5][r]; tough[1 + r] = TOUGH[lv % 5][r]; }
+    broken = 0;
+}
+
+void hitBrick(int x, int y) {
+    uint8_t m = 1U << x;
+    if (tough[y] & m) tough[y] &= ~m; // First hit only cracks a tough brick.
+    else bricks[y] &= ~m;             // Second hit (or a normal brick) destroys it.
+    score++;
+    broken++;
+}
+
+uint32_t ballInterval() { // Ball speeds up with each level and each brick.
+    int v = 250 - level * 15 - broken * 2;
+    return v < 70 ? 70 : v;
+}
+
+void resetDemo() {
+    level++;
+    loadLevel(level);
+    bx = 3; by = 5; vx = 1; vy = -1;
+}
+
+void startGame(uint32_t now) {
+    randomSeed(micros());
+    score = 0; lives = 3; level = 0; pw = 3; px = 2; newBest = false;
+    loadLevel(0);
+    setMode(INTRO, now);
+}
+
+void endGame(uint32_t now) {
+    newBest = score > best;
+    if (newBest) { best = score; prefs.putUShort("best", best); }
+    setMode(GAMEOVER, now);
+}
+
+void movePaddle(int dir, uint32_t now) {
+    px = clampInt(px + dir, 0, 8 - pw);
+    lastPaddleDir = dir;
+    lastPaddleMove = now;
+}
+
+void usePaddleInput(uint32_t now) {
+    if (btnL == btnR) return; // Neither or both pressed.
+    if (now - lastPaddleStep < PADDLE_MS) return;
+    lastPaddleStep = now;
+    movePaddle(btnL ? -1 : 1, now);
+}
+
+void stepBall(uint32_t now) {
+    int nx = bx + vx, ny = by + vy;
+    if (nx < 0 || nx > 7) { vx = -vx; nx = bx + vx; } // Side walls.
+    if (ny < 0) { vy = 1; ny = by + vy; }             // Ceiling.
+    if (ny >= 7) {                                    // Paddle row.
+        if (nx >= px && nx < px + pw) {
+            int rel = nx - px;                        // Where on the paddle it landed.
+            vx = (pw == 3) ? rel - 1 : (rel == 0 ? -1 : 1);
+            if (vx == 0 && now - lastPaddleMove < 180) vx = lastPaddleDir; // Moving paddle adds spin.
+            vy = -1;
+            ny = 6;
+        } else if (mode == PLAY) {
+            bx = nx; by = 7; lives--;
+            setMode(LOSTBALL, now);
+            return;
+        } else { vy = -1; ny = 6; } // Demo safety net.
+    } else if (brickAt(nx, ny)) {
+        hitBrick(nx, ny);
+        vy = -vy;
+        ny = by + vy;
+        nx = bx + vx;
+        if (nx < 0 || nx > 7) { vx = -vx; nx = bx + vx; }
+        if (ny < 0 || ny > 6 || brickAt(nx, ny)) { nx = bx; ny = by; } // Boxed in: bounce on the spot.
     }
-    return false; // No checked segment occupies this cell.
+    bx = nx; by = ny;
+    if (bricksLeft() == 0) {
+        if (mode == PLAY) setMode(CLEARED, now);
+        else resetDemo();
+    }
 }
 
-void placeFood() { // Chooses an empty cell for the next food.
-    int empty = 64 - snakeLength; // Counts the unoccupied cells.
-    if (empty == 0) return; // A full board has no room for food.
-    int chosen = random(empty); // Chooses an empty-cell index at random.
-    for (int y = 0; y < 8; ++y) { // Checks each row.
-        for (int x = 0; x < 8; ++x) { // Checks each column.
-            if (occupied(x, y, snakeLength)) continue; // Skips snake cells.
-            if (chosen-- == 0) { // Stops at the selected empty cell.
-                foodX = x; // Stores the food column.
-                foodY = y; // Stores the food row.
-                return; // Finishes placing food.
+void demoAim() { // Attract-mode autopilot: moves the paddle under the falling ball.
+    if (vy > 0 && by == 6) {
+        int nx = bx + vx;
+        if (nx < 0 || nx > 7) nx = bx - vx;
+        px = clampInt(nx - (int)random(pw), 0, 8 - pw);
+    }
+}
+
+void readButtons(uint32_t now) {
+    pressedMask = 0;
+    for (uint8_t i = 0; i < 2; ++i) {
+        bool raw = digitalRead(buttonPins[i]);
+        if (raw != lastRaw[i]) { lastRaw[i] = raw; changedAt[i] = now; }
+        if (now - changedAt[i] >= DEBOUNCE_MS && raw != stableButton[i]) {
+            stableButton[i] = raw;
+            if (raw == LOW) pressedMask |= (1U << i);
+        }
+    }
+    btnL = stableButton[0] == LOW;
+    btnR = stableButton[1] == LOW;
+    bool both = btnL && btnR;
+    bothEdge = both && !bothPrev;
+    bothPrev = both;
+}
+
+void update(uint32_t now) {
+    uint32_t t = now - modeSince;
+    switch (mode) {
+    case DEMO:
+        if (pressedMask) { startGame(now); break; }
+        if (now - lastBall >= 170) { lastBall = now; demoAim(); stepBall(now); }
+        break;
+    case INTRO:
+        if (t >= 1000) setMode(SERVE, now);
+        break;
+    case SERVE:
+        usePaddleInput(now);
+        bx = px + pw / 2; by = 6;
+        if (bothEdge || t > 4000) { // Launch.
+            vx = random(2) ? 1 : -1; vy = -1;
+            lastBall = now;
+            setMode(PLAY, now);
+        }
+        break;
+    case PLAY:
+        usePaddleInput(now);
+        if (now - lastBall >= ballInterval()) { lastBall = now; stepBall(now); }
+        break;
+    case LOSTBALL:
+        if (t >= 800) { if (lives == 0) endGame(now); else setMode(SERVE, now); }
+        break;
+    case CLEARED:
+        if (t >= 1000) {
+            level++;
+            pw = level >= 5 ? 2 : 3;
+            px = clampInt(px, 0, 8 - pw);
+            loadLevel(level);
+            setMode(INTRO, now);
+        }
+        break;
+    case GAMEOVER:
+        if (t > 1500 && pressedMask) startGame(now);
+        break;
+    }
+}
+
+// ---------- Drawing ----------
+void drawField(uint32_t now, bool showBall) {
+    for (int y = 0; y < 8; ++y)
+        for (int x = 0; x < 8; ++x)
+            if (bricks[y] & (1U << x)) {
+                if ((tough[y] & (1U << x)) && ((now / 250) % 2)) continue; // Tough bricks blink.
+                putPixel(x, y);
             }
+    for (int i = 0; i < pw; ++i) putPixel(px + i, 7);
+    if (showBall) putPixel(bx, by);
+}
+
+void drawGame(uint32_t now) {
+    uint32_t t = now - modeSince;
+    for (int i = 0; i < 8; ++i) pixels[i] = 0;
+    switch (mode) {
+    case DEMO:
+    case PLAY:
+        drawField(now, true);
+        break;
+    case INTRO:
+        drawNumber(level + 1);
+        break;
+    case SERVE:
+        drawField(now, (now / 200) % 2 == 0);
+        for (int i = 0; i < lives; ++i) putPixel(i, 0); // Lives shown as dots while serving.
+        break;
+    case LOSTBALL:
+        drawField(now, (now / 80) % 2 == 0);
+        break;
+    case CLEARED: { // A bright sweep rises from the bottom.
+        int rows = t / 110;
+        for (int y = 7; y >= 8 - rows && y >= 0; --y)
+            for (int x = 0; x < 8; ++x) putPixel(x, y);
+        break;
+    }
+    case GAMEOVER:
+        if (t < 700) {
+            for (int i = 0; i < 8; ++i) { putPixel(i, i); putPixel(7 - i, i); }
+        } else if (!newBest || (now / 250) % 2 == 0) { // New record blinks.
+            drawNumber(score);
         }
+        break;
     }
+    for (uint8_t row = 0; row < 8; ++row) maxWrite(row + 1, pixels[row]);
 }
 
-void startGame(uint32_t now) { // Starts or resets the game.
-    randomSeed(micros()); // Uses the player's timing to vary the food sequence.
-    snakeLength = 3; // Restores the starting length.
-    for (int i = 0; i < snakeLength; ++i) { // Positions the initial segments.
-        snakeX[i] = 3 - i; // Places the head at column 3, with its body behind.
-        snakeY[i] = 4; // Places all starting segments on row 4.
-    }
-    direction = 1; // Starts moving right.
-    turnQueued = false; // Cancels any old turn request.
-    state = PLAYING; // Activates the game.
-    placeFood(); // Places the first food.
-    lastMove = now; // Gives the player a full interval before the first move.
+void setup() {
+    pinMode(LEFT_PIN, INPUT_PULLUP);
+    pinMode(RIGHT_PIN, INPUT_PULLUP);
+    initMatrix();
+    prefs.begin("breakout", false);
+    best = prefs.getUShort("best", 0);
+    randomSeed(micros());
+    loadLevel(0);
+    setMode(DEMO, millis());
 }
 
-void readButtons(uint32_t now) { // Debounces and handles both buttons.
-    uint8_t pressed = 0; // Clears this loop's new button presses.
-    for (uint8_t i = 0; i < 2; ++i) { // Reads each button.
-        bool raw = digitalRead(buttonPins[i]); // LOW means the button is pressed.
-        if (raw != lastRaw[i]) { // Detects an electrical change.
-            lastRaw[i] = raw; // Remembers the new electrical reading.
-            changedAt[i] = now; // Restarts this button's debounce timer.
-        }
-        if (now - changedAt[i] >= DEBOUNCE_MS && raw != stableButton[i]) { // Accepts a stable change.
-            stableButton[i] = raw; // Stores the debounced reading.
-            if (raw == LOW) pressed |= (1U << i); // Records only new presses.
-        }
-    }
-    if (pressed & 1U) { // Gives the left reset button priority.
-        startGame(now); // Immediately starts a fresh game.
-        return; // Does not also turn when both buttons are pressed together.
-    }
-    if ((pressed & 2U) && state == PLAYING && stableButton[0] == HIGH) { // Accepts right presses while playing and reset is released.
-        turnQueued = true; // Queues one clockwise turn for the next move.
-    }
-}
-
-void stepSnake() { // Advances the snake by one cell.
-    if (turnQueued) direction = (direction + 1) % 4; // Applies a clockwise turn.
-    turnQueued = false; // Clears the turn request after using it.
-    int nx = snakeX[0] + dx[direction]; // Calculates the next head column.
-    int ny = snakeY[0] + dy[direction]; // Calculates the next head row.
-    if (WRAP_EDGES) { // Optionally connects opposite edges.
-        nx = (nx + 8) % 8; // Wraps the horizontal position.
-        ny = (ny + 8) % 8; // Wraps the vertical position.
-    } else if (nx < 0 || nx > 7 || ny < 0 || ny > 7) { // Detects a wall collision.
-        state = LOST; // Ends the game.
-        return; // Leaves the snake inside the board.
-    }
-    bool eating = nx == foodX && ny == foodY; // Checks whether the head finds food.
-    int count = snakeLength - (eating ? 0 : 1); // Excludes the tail when it will move away.
-    if (occupied(nx, ny, count)) { // Detects a collision with the remaining body.
-        state = LOST; // Ends the game.
-        return; // Stops this move.
-    }
-    int newLength = snakeLength + (eating ? 1 : 0); // Grows only when eating.
-    for (int i = newLength - 1; i > 0; --i) { // Moves body positions from tail to head.
-        snakeX[i] = snakeX[i - 1]; // Copies the preceding segment's column.
-        snakeY[i] = snakeY[i - 1]; // Copies the preceding segment's row.
-    }
-    snakeX[0] = nx; // Moves the head to its new column.
-    snakeY[0] = ny; // Moves the head to its new row.
-    snakeLength = newLength; // Saves the updated length.
-    if (snakeLength == 64) state = WON; // Wins when the snake fills the board.
-    else if (eating) placeFood(); // Places new food after growing.
-}
-
-void drawGame(uint32_t now) { // Builds and sends the current display image.
-    for (int i = 0; i < 8; ++i) pixels[i] = 0; // Clears the previous image.
-    if (state == WAITING) { // Shows a right-pointing arrow before starting.
-        for (int x = 1; x <= 6; ++x) putPixel(x, 3); // Draws the arrow shaft.
-        putPixel(4, 1); // Draws the upper arrowhead tip.
-        putPixel(5, 2); // Draws the upper arrowhead slope.
-        putPixel(5, 4); // Draws the lower arrowhead slope.
-        putPixel(4, 5); // Draws the lower arrowhead tip.
-    } else if (state == LOST) { // Shows an X after a collision.
-        for (int i = 0; i < 8; ++i) { // Draws both diagonals.
-            putPixel(i, i); // Draws the first diagonal.
-            putPixel(7 - i, i); // Draws the second diagonal.
-        }
-    } else if (state == WON) { // Shows a tick after filling the board.
-        putPixel(1, 4); // Starts the short stroke.
-        putPixel(2, 5); // Continues the short stroke.
-        putPixel(3, 6); // Draws the bottom of the tick.
-        for (int x = 4; x <= 7; ++x) putPixel(x, 9 - x); // Draws the long stroke.
-    } else { // Shows the active game.
-        for (int i = 0; i < snakeLength; ++i) putPixel(snakeX[i], snakeY[i]); // Draws the snake.
-        if ((now / 220) % 2 == 0) putPixel(foodX, foodY); // Makes the food blink.
-    }
-    for (uint8_t row = 0; row < 8; ++row) maxWrite(row + 1, pixels[row]); // Sends all rows.
-}
-
-void setup() { // Runs once after power-up or hardware reset.
-    pinMode(LEFT_PIN, INPUT_PULLUP); // Holds the left input HIGH until pressed.
-    pinMode(RIGHT_PIN, INPUT_PULLUP); // Holds the right input HIGH until pressed.
-    initMatrix(); // Prepares the LED matrix.
-    drawGame(millis()); // Displays the starting arrow.
-}
-
-void loop() { // Repeats continuously while the board has power.
-    uint32_t now = millis(); // Reads elapsed time in milliseconds.
-    readButtons(now); // Processes button presses without blocking movement.
-    if (state == PLAYING && now - lastMove >= STEP_MS) { // Checks whether a move is due.
-        lastMove = now; // Restarts the movement timer.
-        stepSnake(); // Moves the snake once.
-    }
-    if (now - lastDraw >= 40) { // Refreshes the image every 40 milliseconds.
-        lastDraw = now; // Restarts the display timer.
-        drawGame(now); // Updates the visible LEDs.
-    }
-    delay(1); // Yields briefly to the ESP32 background tasks.
+void loop() {
+    uint32_t now = millis();
+    readButtons(now);
+    update(now);
+    if (now - lastDraw >= 25) { lastDraw = now; drawGame(now); }
+    delay(1);
 }
